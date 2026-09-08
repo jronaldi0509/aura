@@ -5,7 +5,7 @@
 use std::io::{BufRead, Write};
 use std::sync::{
     Arc, LazyLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -19,8 +19,33 @@ use crossterm::{
 use signal_hook::{
     SigId,
     consts::signal::{SIGINT, SIGTERM},
+    low_level,
 };
 use unicode_width::UnicodeWidthChar;
+
+const OUTSIDE_PROMPT: usize = 0;
+const ACTIVE_PROMPT: usize = 1;
+
+fn signal_state(signal: i32) -> usize {
+    signal as usize + 1
+}
+
+fn state_signal(state: usize) -> Option<usize> {
+    (state > ACTIVE_PROMPT).then_some(state - 1)
+}
+
+/// Record a signal while a prompt owns the terminal. A `true` return means
+/// teardown already won the atomic transition and the default action must run.
+fn record_prompt_signal(state: &AtomicUsize, signal: i32) -> bool {
+    state
+        .compare_exchange(
+            ACTIVE_PROMPT,
+            signal_state(signal),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err_and(|current| current == OUTSIDE_PROMPT)
+}
 
 fn is_prompt_interrupt(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
@@ -28,35 +53,40 @@ fn is_prompt_interrupt(key: &KeyEvent) -> bool {
 }
 
 struct PromptSignals {
-    outside_prompt: Arc<AtomicBool>,
-    pending_signal: Arc<AtomicUsize>,
+    state: Arc<AtomicUsize>,
     _signal_ids: Vec<SigId>,
 }
 
 impl PromptSignals {
     fn install() -> std::io::Result<Self> {
-        let outside_prompt = Arc::new(AtomicBool::new(true));
-        let pending_signal = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(AtomicUsize::new(OUTSIDE_PROMPT));
         let mut signal_ids = Vec::new();
         for signal in [SIGINT, SIGTERM] {
             // Keep the signal-hook actions for the process lifetime. Removing
             // the final action would leave the signal ignored rather than
             // restoring its default disposition.
-            signal_ids.push(signal_hook::flag::register_conditional_default(
-                signal,
-                Arc::clone(&outside_prompt),
-            )?);
-            signal_ids.push(signal_hook::flag::register_usize(
-                signal,
-                Arc::clone(&pending_signal),
-                signal as usize,
-            )?);
+            let state = Arc::clone(&state);
+            signal_ids.push(unsafe {
+                // SAFETY: the handler performs only atomic operations and
+                // signal-hook's signal-safe default-action emulation.
+                low_level::register(signal, move || {
+                    if record_prompt_signal(&state, signal) {
+                        let _ = low_level::emulate_default_handler(signal);
+                    }
+                })?
+            });
         }
         Ok(Self {
-            outside_prompt,
-            pending_signal,
+            state,
             _signal_ids: signal_ids,
         })
+    }
+
+    fn finish_prompt(&self) -> Option<usize> {
+        // The swap linearizes teardown with the signal handler's compare-and-
+        // exchange. A signal is therefore either returned here or observes the
+        // outside state and takes its default action; it cannot be swallowed.
+        state_signal(self.state.swap(OUTSIDE_PROMPT, Ordering::SeqCst))
     }
 }
 
@@ -65,6 +95,7 @@ static PROMPT_SIGNALS: LazyLock<std::io::Result<PromptSignals>> =
 
 struct RawModeGuard {
     signals: &'static PromptSignals,
+    active: bool,
 }
 
 impl RawModeGuard {
@@ -72,24 +103,41 @@ impl RawModeGuard {
         let signals = PROMPT_SIGNALS
             .as_ref()
             .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
-        signals.pending_signal.store(0, Ordering::SeqCst);
-        signals.outside_prompt.store(false, Ordering::SeqCst);
+        signals.state.store(ACTIVE_PROMPT, Ordering::SeqCst);
         if let Err(error) = crossterm::terminal::enable_raw_mode() {
-            signals.outside_prompt.store(true, Ordering::SeqCst);
+            signals.finish_prompt();
             return Err(error);
         }
-        Ok(Self { signals })
+        Ok(Self {
+            signals,
+            active: true,
+        })
     }
 
-    fn pending_signal(&self) -> usize {
-        self.signals.pending_signal.load(Ordering::SeqCst)
+    fn pending_signal(&self) -> Option<usize> {
+        state_signal(self.signals.state.load(Ordering::SeqCst))
+    }
+
+    fn restore(&mut self) -> Option<usize> {
+        if !self.active {
+            return None;
+        }
+        let _ = crossterm::terminal::disable_raw_mode();
+        self.active = false;
+        self.signals.finish_prompt()
+    }
+
+    fn finish<T>(mut self, value: T) -> Result<T> {
+        if let Some(signal) = self.restore() {
+            bail!("init interrupted by signal {signal}");
+        }
+        Ok(value)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        self.signals.outside_prompt.store(true, Ordering::SeqCst);
+        self.restore();
     }
 }
 
@@ -201,8 +249,7 @@ fn read_tty_answer(echo: bool) -> Result<Option<String>> {
     let mut editor = LineEditor::default();
 
     loop {
-        let signal = raw_mode.pending_signal();
-        if signal != 0 {
+        if let Some(signal) = raw_mode.pending_signal() {
             bail!("init interrupted by signal {signal}");
         }
         if !event::poll(Duration::from_millis(50))? {
@@ -230,14 +277,14 @@ fn read_tty_answer(echo: bool) -> Result<Option<String>> {
             KeyCode::Enter => {
                 print!("\r\n");
                 std::io::stdout().flush()?;
-                return Ok(Some(editor.text()));
+                return raw_mode.finish(Some(editor.text()));
             }
             KeyCode::Char('d')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && editor.chars.is_empty() =>
             {
                 print!("\r\n");
                 std::io::stdout().flush()?;
-                return Ok(None);
+                return raw_mode.finish(None);
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let columns = editor.cursor_width();
@@ -539,11 +586,20 @@ impl<R: BufRead> Prompter<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use signal_hook::consts::signal::SIGTERM;
 
     use crate::init::test_support::{non_interactive, scripted};
 
-    use super::{LineEditor, is_prompt_interrupt};
+    use super::{
+        ACTIVE_PROMPT, LineEditor, OUTSIDE_PROMPT, PromptSignals, is_prompt_interrupt,
+        record_prompt_signal,
+    };
 
     fn sample_shortlist() -> Vec<String> {
         vec![
@@ -565,6 +621,25 @@ mod tests {
             KeyCode::Char('c'),
             KeyModifiers::NONE,
         )));
+    }
+
+    #[test]
+    fn prompt_signal_and_teardown_have_no_unhandled_order() {
+        let signals = PromptSignals {
+            state: Arc::new(AtomicUsize::new(ACTIVE_PROMPT)),
+            _signal_ids: Vec::new(),
+        };
+
+        // If the handler wins, teardown consumes the pending signal.
+        assert!(!record_prompt_signal(&signals.state, SIGTERM));
+        assert_eq!(signals.finish_prompt(), Some(SIGTERM as usize));
+
+        // If teardown wins, the handler observes that it must run the signal's
+        // default action instead of leaving an unconsumed pending value.
+        signals.state.store(ACTIVE_PROMPT, Ordering::SeqCst);
+        assert_eq!(signals.finish_prompt(), None);
+        assert!(record_prompt_signal(&signals.state, SIGTERM));
+        assert_eq!(signals.state.load(Ordering::SeqCst), OUTSIDE_PROMPT);
     }
 
     #[test]
